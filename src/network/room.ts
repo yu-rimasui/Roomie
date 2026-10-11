@@ -14,6 +14,14 @@ export type RoomEvents = {
 const url = import.meta.env.VITE_SUPABASE_URL;
 const key = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
 export const onlineConfigured = Boolean(url && key);
+export function rememberedRoom() {
+  if (!onlineConfigured) return "";
+  try {
+    return localStorage.getItem("roomie-last-room") || "";
+  } catch {
+    return "";
+  }
+}
 export function inviteCode(input: string) {
   try {
     if (input.includes("://"))
@@ -155,158 +163,206 @@ async function onlineRoom(
   code: string | undefined,
   events: RoomEvents,
 ): Promise<Connection> {
+  if (
+    code &&
+    !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.[a-f0-9]{48}$/.test(code)
+  )
+    throw new Error("オンライン用の招待リンクを確認してください。");
   const client = createClient(url, key, {
     auth: {
-      storage: sessionStorage,
+      storage: localStorage,
       storageKey: "roomie-auth",
       detectSessionInUrl: false,
     },
   });
-  const { data: existing } = await client.auth.getSession();
-  let session = existing.session;
-  if (!session) {
-    const result = await client.auth.signInAnonymously();
-    if (result.error)
-      throw new Error(
-        "匿名認証に失敗しました。Supabase設定を確認してください。",
-      );
-    session = result.data.session;
-  }
-  if (!session) throw new Error("認証セッションを作成できませんでした。");
-  let roomId: string, slot: number, roomCode: string;
-  if (code) {
-    if (!/^[a-f0-9-]{36}\.[a-f0-9]{48}$/.test(code))
-      throw new Error("オンライン用の招待リンクを確認してください。");
-    const [rid, token] = code.split(".");
-    const { data, error } = await client.rpc("join_room", {
-      target_room: rid,
-      invite_token: token,
-    });
-    if (error)
-      throw new Error("参加できません。招待が無効、またはルームが満員です。");
-    roomId = rid;
-    slot = data;
-    roomCode = code;
-  } else {
-    const { data, error } = await client.rpc("create_room");
-    if (error)
-      throw new Error("ルームを作成できません。SQLの適用を確認してください。");
-    roomId = data.room_id;
-    slot = 0;
-    roomCode = `${roomId}.${data.invite_token}`;
-  }
-  const id = session.user.id;
-  await client.realtime.setAuth(session.access_token);
-  let closed = false,
-    active = new Set<string>(),
-    roster: Player[] = [];
-  const emit = () =>
-    events.peers(roster.filter((p) => p.id !== id && active.has(p.id)));
-  async function refresh() {
-    const { data, error } = await client
-      .from("room_members")
-      .select("user_id,slot,area,x,z,yaw")
-      .eq("room_id", roomId);
-    if (error) {
-      events.status("同期エラー");
-      return;
-    }
-    if (closed) return;
-    roster = (data ?? []).map(rowPlayer).filter(validPlayer);
-    emit();
-  }
-  const channel = client
-    .channel(`room:${roomId}`, {
-      config: { private: true, presence: { key: id } },
-    })
-    .on(
-      "postgres_changes",
-      {
-        event: "UPDATE",
-        schema: "public",
-        table: "room_members",
-        filter: `room_id=eq.${roomId}`,
-      },
-      ({ new: row }) => {
-        const player = rowPlayer(row);
-        if (!validPlayer(player)) return;
-        roster = roster.filter((p) => p.id !== player.id);
-        roster.push(player);
-        emit();
-      },
-    )
-    .on("presence", { event: "sync" }, () => {
-      active = new Set(Object.keys(channel.presenceState()));
-      void refresh();
-    });
-  await new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(
-      () => reject(new Error("接続がタイムアウトしました。")),
-      12000,
-    );
-    channel.subscribe(async (status) => {
-      if (closed) return;
-      if (status === "SUBSCRIBED") {
-        const result = await channel.track({ online: true });
-        if (result !== "ok") {
-          clearTimeout(timeout);
-          reject(new Error("在室情報を送信できません。"));
-          return;
-        }
-        events.status("オンライン");
-        clearTimeout(timeout);
-        resolve();
-      } else if (["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(status)) {
-        events.status("切断・再接続中");
-        events.peers([]);
-        clearTimeout(timeout);
-        reject(
-          new Error("Realtimeに接続できません。権限設定を確認してください。"),
+  let closed = false;
+  try {
+    const { data: existing, error: sessionError } = await client.auth.getSession();
+    if (sessionError) throw new Error("認証セッションを確認できませんでした。");
+    let session = existing.session;
+    if (!session) {
+      const result = await client.auth.signInAnonymously();
+      if (result.error)
+        throw new Error(
+          "匿名認証に失敗しました。Supabase設定を確認してください。",
         );
-      }
-    });
-  }).catch(async (e) => {
-    closed = true;
-    await client.removeChannel(channel);
-    client.auth.stopAutoRefresh();
-    throw e;
-  });
-  let last = 0,
-    pending = false,
-    lastSent = "";
-  return {
-    code: roomCode,
-    slot,
-    mode: "online",
-    send: (p) => {
-      const signature = `${p.area}:${p.x}:${p.z}:${p.yaw}`;
-      if (
-        pending ||
-        signature === lastSent ||
-        performance.now() - last < 100 ||
-        closed
-      )
-        return;
-      last = performance.now();
-      pending = true;
-      void client
+      session = result.data.session;
+    }
+    if (!session) throw new Error("認証セッションを作成できませんでした。");
+    let roomId: string, slot: number, roomCode: string;
+    if (code) {
+      const [rid, token] = code.split(".");
+      const { data, error } = await client.rpc("join_room", {
+        target_room: rid,
+        invite_token: token,
+      });
+      if (error)
+        throw new Error("参加できません。招待が無効、またはルームが満員です。");
+      roomId = rid;
+      slot = data;
+      roomCode = code;
+    } else {
+      const { data, error } = await client.rpc("create_room");
+      if (error)
+        throw new Error("ルームを作成できません。SQLの適用を確認してください。");
+      roomId = data.room_id;
+      slot = 0;
+      roomCode = `${roomId}.${data.invite_token}`;
+    }
+    const id = session.user.id;
+    await client.realtime.setAuth(session.access_token);
+    let connected = false,
+      subscription = 0,
+      active = new Set<string>(),
+      roster: Player[] = [];
+    const emit = () =>
+      events.peers(
+        connected ? roster.filter((p) => p.id !== id && active.has(p.id)) : [],
+      );
+    async function refresh() {
+      const { data, error } = await client
         .from("room_members")
-        .update({ area: p.area, x: p.x, z: p.z, yaw: p.yaw })
-        .eq("room_id", roomId)
-        .eq("user_id", id)
-        .then(({ error }) => {
-          pending = false;
-          if (error) events.status("位置同期エラー");
-          else lastSent = signature;
-        });
-    },
-    close: async () => {
-      closed = true;
-      await client.removeChannel(channel);
+        .select("user_id,slot,area,x,z,yaw")
+        .eq("room_id", roomId);
+      if (closed || !connected) return;
+      if (error) {
+        events.status("同期エラー");
+        return;
+      }
+      roster = (data ?? []).map(rowPlayer).filter(validPlayer);
+      emit();
+    }
+    const channel = client
+      .channel(`room:${roomId}`, {
+        config: { private: true, presence: { key: id } },
+      })
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "room_members",
+          filter: `room_id=eq.${roomId}`,
+        },
+        ({ new: row }) => {
+          if (closed) return;
+          const player = rowPlayer(row);
+          if (!validPlayer(player)) return;
+          roster = roster.filter((p) => p.id !== player.id);
+          roster.push(player);
+          emit();
+        },
+      )
+      .on("presence", { event: "sync" }, () => {
+        if (closed) return;
+        active = new Set(Object.keys(channel.presenceState()));
+        emit();
+        void refresh();
+      });
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error("接続がタイムアウトしました。")),
+        12000,
+      );
+      channel.subscribe(async (status) => {
+        if (closed) return;
+        const attempt = ++subscription;
+        if (status === "SUBSCRIBED") {
+          const result = await channel.track({ online: true }).catch(() => "error");
+          if (closed || attempt !== subscription) return;
+          if (result !== "ok") {
+            connected = false;
+            events.status("在室情報の送信エラー・再入室してください");
+            events.peers([]);
+            clearTimeout(timeout);
+            reject(new Error("在室情報を送信できません。"));
+            return;
+          }
+          connected = true;
+          events.status("オンライン");
+          void refresh();
+          clearTimeout(timeout);
+          resolve();
+        } else if (["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(status)) {
+          connected = false;
+          active.clear();
+          events.status("切断・再接続中");
+          events.peers([]);
+          clearTimeout(timeout);
+          reject(
+            new Error("Realtimeに接続できません。権限設定を確認してください。"),
+          );
+        }
+      });
+    });
+    let last = 0,
+      pending = false,
+      lastSent = "";
+    try {
+      localStorage.setItem("roomie-last-room", roomCode);
+    } catch {
+      throw new Error("再入室に必要な保存ができません。ブラウザの保存設定を確認してください。");
+    }
+    return {
+      code: roomCode,
+      slot,
+      mode: "online",
+      send: (p) => {
+        const signature = `${p.area}:${p.x}:${p.z}:${p.yaw}`;
+        if (
+          pending ||
+          signature === lastSent ||
+          performance.now() - last < 100 ||
+          closed
+        )
+          return;
+        last = performance.now();
+        pending = true;
+        void Promise.resolve(
+          client
+            .from("room_members")
+            .update({ area: p.area, x: p.x, z: p.z, yaw: p.yaw })
+            .eq("room_id", roomId)
+            .eq("user_id", id),
+        )
+          .then(
+            ({ error }) => {
+              if (closed) return;
+              if (error) {
+                if (connected) events.status("位置同期エラー");
+              } else {
+                lastSent = signature;
+                if (connected) events.status("オンライン");
+              }
+            },
+            () => {
+              if (!closed && connected) events.status("位置同期エラー");
+            },
+          )
+          .finally(() => {
+            pending = false;
+          });
+      },
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        events.peers([]);
+        try {
+          await client.removeChannel(channel);
+        } finally {
+          client.auth.stopAutoRefresh();
+        }
+      },
+    };
+  } catch (error) {
+    closed = true;
+    try {
+      await client.removeAllChannels();
+    } finally {
       client.auth.stopAutoRefresh();
-      events.peers([]);
-    },
-  };
+    }
+    throw error;
+  }
 }
 export async function connectRoom(
   code: string | undefined,

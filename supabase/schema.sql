@@ -42,8 +42,9 @@ create function public.join_room(target_room uuid,invite_token text) returns sma
 declare stored bytea; chosen smallint;
 begin
   if auth.uid() is null then raise exception 'Authentication required'; end if;
+  if invite_token is null or invite_token !~ '^[a-f0-9]{48}$' then raise exception 'Invalid invite'; end if;
   select invite_hash into stored from public.rooms where id=target_room for update;
-  if stored is null or stored<>extensions.digest(invite_token,'sha256') then raise exception 'Invalid invite'; end if;
+  if stored is null or stored is distinct from extensions.digest(invite_token,'sha256') then raise exception 'Invalid invite'; end if;
   select slot into chosen from public.room_members where room_id=target_room and user_id=auth.uid();
   if chosen is not null then return chosen; end if;
   if (select count(*) from public.room_members where room_id=target_room)>=2 then raise exception 'Room full'; end if;

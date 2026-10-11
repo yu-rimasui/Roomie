@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
+    "build:online": "tsc --noEmit && vite build --mode online",
     "preview": "vite preview --host 127.0.0.1",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:online": "node tests/online-check.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "2.112.3",

@@ -5,6 +5,7 @@ import {
   connectRoom,
   inviteCode,
   onlineConfigured,
+  rememberedRoom,
   type Connection,
 } from "./network/room";
 function Icon({ name, size = 20 }: { name: string; size?: number }) {
@@ -88,11 +89,12 @@ export default function App() {
     [view, setView] = useState<View>("overhead");
   const [peers, setPeers] = useState<Player[]>([]),
     [status, setStatus] = useState("ひとりで探索中");
-  const [modal, setModal] = useState<"room" | "help" | null>(
-    location.hash.includes("invite=") ? "room" : null,
-  );
   const [input, setInput] = useState(
-    () => new URLSearchParams(location.hash.slice(1)).get("invite") || "",
+    () =>
+      new URLSearchParams(location.hash.slice(1)).get("invite") || rememberedRoom(),
+  );
+  const [modal, setModal] = useState<"room" | "help" | null>(
+    input ? "room" : null,
   );
   const [busy, setBusy] = useState(false),
     [error, setError] = useState(""),
@@ -164,6 +166,7 @@ export default function App() {
       )
         player.current.x = 1.6;
       setCode(next.code);
+      setInput(next.code);
       history.replaceState(
         null,
         "",
@@ -499,7 +502,7 @@ export default function App() {
                         ? "コピーしました。"
                         : local
                           ? "リンクを同じブラウザの別タブで開いてください。"
-                          : "参加できるのは2人までです。"}
+                          : "参加できるのは2人まで。同じブラウザで、次回もこのルームに戻れます。"}
                     </div>
                     <button
                       className="primary-button"
