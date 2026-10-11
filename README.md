@@ -150,7 +150,11 @@ NPC、クエスト、アイテム、家具編集、スマートフォン専用�
 
 [`supabase/tests/room_safety.sql`](supabase/tests/room_safety.sql) は、スキーマ適用済みの空の使い捨てDB専用の回帰チェックです。テスト用ユーザー・ルームはROLLBACKします。ローカルPostgreSQL 17で、新規スキーマと従来スキーマ＋002の両方が成功しました。NULL入りの従来データでは002が中止し、そのデータを保持することも確認しました。別セッションから8件を同時実行し、個人上限3室と全体上限100室を越えないことを確認しました。AuthとRealtimeのスキーマは最小の検証用定義で、実SupabaseのHTTP・認証・WebSocketを代替した検証ではありません。
 
-**002はまだ実Supabaseに適用していません。この変更の再公開も未実施です。** 実サービスの接続チェックは002適用後に実行してください。
+2026-10-12に002をRoomieの実Supabaseへ適用し、`npm run test:online` が成功しました。同時作成の頻度制限、招待再発行と旧リンク拒否、NULL更新拒否、同時参加上限、RLS、非公開Presence、双方向座標配信、再入室、端末ログアウトを確認済みです。承認された検証用の匿名ユーザー3人とルーム2件はDBに残しています。
+
+コード `132cbc9` のオンラインビルドを [Vercel Preview](https://roomie-preview-b940283-hxsvo2pzw-yu-rimasuis-projects.vercel.app/) へ公開しました。ブラウザでゲーム画面の表示、新しいJSの読み込み、空になる招待URLの拒否、端末ログアウトの確認画面を確認しました。Vercel認証保護付きのPreviewです。Productionは更新していません。
+
+配信対象は `dist/` の静的4ファイルだけです。既存プロジェクトのViteビルド設定で再ビルドされないよう、今回の配信設定で `framework: null`、`buildCommand: ""`、`installCommand: ""`、`outputDirectory: "."` を指定しました。プロジェクト共通の設定は変更していません。[Vercelの配信ごとの設定](https://vercel.com/docs/project-configuration/vercel-json)
 
 公開前に残る確認:
 
