@@ -6,6 +6,7 @@ export type Connection = {
   mode: "local" | "online";
   send: (p: Player) => void;
   close: () => Promise<void>;
+  rotateInvite?: () => Promise<string>;
 };
 export type RoomEvents = {
   peers: (players: Player[]) => void;
@@ -14,15 +15,18 @@ export type RoomEvents = {
 const url = import.meta.env.VITE_SUPABASE_URL;
 const key = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
 export const onlineConfigured = Boolean(url && key);
+export const MAX_INVITE_INPUT = 2048;
+const onlineInvite = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.[a-f0-9]{48}$/;
 export function rememberedRoom() {
   if (!onlineConfigured) return "";
   try {
-    return localStorage.getItem("roomie-last-room") || "";
+    return inviteCode(localStorage.getItem("roomie-last-room") || "");
   } catch {
     return "";
   }
 }
 export function inviteCode(input: string) {
+  if (input.length > MAX_INVITE_INPUT) return "";
   try {
     if (input.includes("://"))
       return (
@@ -149,35 +153,55 @@ async function localRoom(
     },
   };
 }
-function rowPlayer(row: Record<string, unknown>): Player {
-  return {
-    id: row.user_id as string,
-    slot: row.slot as number,
-    area: row.area as Player["area"],
-    x: row.x as number,
-    z: row.z as number,
-    yaw: row.yaw as number,
+function rowPlayer(value: unknown): Player | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const player = {
+    id: row.user_id,
+    slot: row.slot,
+    area: row.area,
+    x: row.x,
+    z: row.z,
+    yaw: row.yaw,
   };
+  return validPlayer(player) ? player : null;
 }
-async function onlineRoom(
-  code: string | undefined,
-  events: RoomEvents,
-): Promise<Connection> {
-  if (
-    code &&
-    !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.[a-f0-9]{48}$/.test(code)
-  )
-    throw new Error("オンライン用の招待リンクを確認してください。");
-  const client = createClient(url, key, {
+function onlineClient(signal?: AbortSignal) {
+  return createClient(url, key, {
+    global: signal ? { fetch: (input, init) => fetch(input, { ...init, signal }) } : undefined,
     auth: {
       storage: localStorage,
       storageKey: "roomie-auth",
       detectSessionInUrl: false,
     },
   });
+}
+export async function logoutDevice() {
+  const client = onlineClient();
+  try {
+    const { error } = await client.auth.signOut({ scope: "local" });
+    if (error) throw new Error("ログアウトできませんでした。接続を確認してやり直してください。");
+    localStorage.removeItem("roomie-last-room");
+  } catch {
+    throw new Error("ログアウトを完了できませんでした。接続とブラウザの保存設定を確認してください。");
+  } finally {
+    client.auth.stopAutoRefresh();
+  }
+}
+async function onlineRoom(
+  code: string | undefined,
+  events: RoomEvents,
+  signal?: AbortSignal,
+): Promise<Connection> {
+  if (
+    code !== undefined && !onlineInvite.test(code)
+  )
+    throw new Error("オンライン用の招待リンクを確認してください。");
+  const client = onlineClient(signal);
   let closed = false;
   try {
     const { data: existing, error: sessionError } = await client.auth.getSession();
+    signal?.throwIfAborted();
     if (sessionError) throw new Error("認証セッションを確認できませんでした。");
     let session = existing.session;
     if (!session) {
@@ -188,9 +212,10 @@ async function onlineRoom(
         );
       session = result.data.session;
     }
+    signal?.throwIfAborted();
     if (!session) throw new Error("認証セッションを作成できませんでした。");
     let roomId: string, slot: number, roomCode: string;
-    if (code) {
+    if (code !== undefined) {
       const [rid, token] = code.split(".");
       const { data, error } = await client.rpc("join_room", {
         target_room: rid,
@@ -198,18 +223,28 @@ async function onlineRoom(
       });
       if (error)
         throw new Error("参加できません。招待が無効、またはルームが満員です。");
+      if (data !== 0 && data !== 1) throw new Error("参加結果を確認できませんでした。");
       roomId = rid;
       slot = data;
       roomCode = code;
     } else {
       const { data, error } = await client.rpc("create_room");
+      if (error?.code === "PT429")
+        throw new Error("ルームの作成が続いています。60秒以上待ってからやり直してください。");
+      if (error?.code === "PT409")
+        throw new Error("作成できるルームは3つまでです。前のルームへ戻ってください。");
+      if (error?.code === "PT503")
+        throw new Error("ルーム作成の受付上限に達しました。管理者にお知らせください。");
       if (error)
         throw new Error("ルームを作成できません。SQLの適用を確認してください。");
+      if (!data || !onlineInvite.test(`${data.room_id}.${data.invite_token}`))
+        throw new Error("ルームの作成結果を確認できませんでした。");
       roomId = data.room_id;
       slot = 0;
       roomCode = `${roomId}.${data.invite_token}`;
     }
     const id = session.user.id;
+    signal?.throwIfAborted();
     await client.realtime.setAuth(session.access_token);
     let connected = false,
       presenceReady = false,
@@ -222,17 +257,22 @@ async function onlineRoom(
         connected ? roster.filter((p) => p.id !== id && active.has(p.id)) : [],
       );
     async function refresh() {
-      const { data, error } = await client
-        .from("room_members")
-        .select("user_id,slot,area,x,z,yaw")
-        .eq("room_id", roomId);
-      if (closed || !connected) return;
-      if (error) {
+      const attempt = subscription;
+      try {
+        const { data, error } = await client
+          .from("room_members")
+          .select("user_id,slot,area,x,z,yaw")
+          .eq("room_id", roomId);
+        if (closed || !connected || attempt !== subscription) return;
+        if (error || !Array.isArray(data)) throw new Error("Invalid roster");
+        roster = data.map(rowPlayer).filter(validPlayer);
+        emit();
+      } catch {
+        if (closed || !connected || attempt !== subscription) return;
+        roster = [];
+        events.peers([]);
         events.status("同期エラー");
-        return;
       }
-      roster = (data ?? []).map(rowPlayer).filter(validPlayer);
-      emit();
     }
     const channel = client
       .channel(`room:${roomId}`, {
@@ -249,7 +289,7 @@ async function onlineRoom(
         ({ new: row }) => {
           if (closed) return;
           const player = rowPlayer(row);
-          if (!validPlayer(player)) return;
+          if (!player) return;
           roster = roster.filter((p) => p.id !== player.id);
           roster.push(player);
           emit();
@@ -266,12 +306,18 @@ async function onlineRoom(
         () => reject(new Error("接続がタイムアウトしました。")),
         12000,
       );
+      const abort = () => {
+        clearTimeout(timeout);
+        reject(new Error("接続をキャンセルしました。"));
+      };
+      signal?.addEventListener("abort", abort, { once: true });
       const ready = () => {
-        if (closed || !presenceReady || !postgresReady) return;
+        if (closed || signal?.aborted || !presenceReady || !postgresReady) return;
         connected = true;
         events.status("オンライン");
         void refresh();
         clearTimeout(timeout);
+        signal?.removeEventListener("abort", abort);
         resolve();
       };
       channel.on("system", {}, (payload) => {
@@ -319,16 +365,34 @@ async function onlineRoom(
     let last = 0,
       pending = false,
       lastSent = "";
+    signal?.throwIfAborted();
     try {
       localStorage.setItem("roomie-last-room", roomCode);
     } catch {
       throw new Error("再入室に必要な保存ができません。ブラウザの保存設定を確認してください。");
     }
     return {
-      code: roomCode,
+      get code() { return roomCode; },
       slot,
       mode: "online",
+      rotateInvite: slot === 0 ? async () => {
+        if (closed) throw new Error("ルームに入り直してください。");
+        const { data, error } = await Promise.resolve(client.rpc("rotate_invite", { target_room: roomId })).catch(() => {
+          throw new Error("招待リンクを再発行できません。接続を確認してください。");
+        });
+        if (error?.code === "PT429") throw new Error("再発行は10秒待ってからやり直してください。");
+        if (error || typeof data !== "string" || !/^[a-f0-9]{48}$/.test(data))
+          throw new Error("招待リンクを再発行できません。SQLの適用と作成者の権限を確認してください。");
+        roomCode = `${roomId}.${data}`;
+        try {
+          localStorage.setItem("roomie-last-room", roomCode);
+        } catch {
+          events.status("新しい招待の保存エラー・リンクを控えてください");
+        }
+        return roomCode;
+      } : undefined,
       send: (p) => {
+        if (!validPlayer(p)) return;
         const signature = `${p.area}:${p.x}:${p.z}:${p.yaw}`;
         if (
           pending ||
@@ -390,8 +454,13 @@ export async function connectRoom(
   code: string | undefined,
   id: string,
   events: RoomEvents,
+  signal?: AbortSignal,
 ) {
+  signal?.throwIfAborted();
+  // Only undefined means creation; an invalid join must never create a room.
+  if (code !== undefined && (typeof code !== "string" || !code.trim() || code.length > 85))
+    throw new Error("招待リンクを確認してください。");
   if (code?.startsWith("local.") || !onlineConfigured)
     return localRoom(code, id, events);
-  return onlineRoom(code, events);
+  return onlineRoom(code, events, signal);
 }

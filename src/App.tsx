@@ -4,6 +4,8 @@ import { spawn, type Area, type Player, type View } from "./game/world";
 import {
   connectRoom,
   inviteCode,
+  logoutDevice,
+  MAX_INVITE_INPUT,
   onlineConfigured,
   rememberedRoom,
   type Connection,
@@ -85,13 +87,15 @@ function Icon({ name, size = 20 }: { name: string; size?: number }) {
 export default function App() {
   const player = useRef(spawn(crypto.randomUUID()));
   const connection = useRef<Connection | null>(null);
+  const generation = useRef(0);
+  const opening = useRef<AbortController | null>(null);
   const [area, setArea] = useState<Area>("home"),
     [view, setView] = useState<View>("overhead");
   const [peers, setPeers] = useState<Player[]>([]),
     [status, setStatus] = useState("ひとりで探索中");
   const [input, setInput] = useState(
     () =>
-      new URLSearchParams(location.hash.slice(1)).get("invite") || rememberedRoom(),
+      inviteCode(location.href) || rememberedRoom(),
   );
   const [modal, setModal] = useState<"room" | "help" | null>(
     input ? "room" : null,
@@ -102,6 +106,7 @@ export default function App() {
     [turn, setTurn] = useState(0),
     [copied, setCopied] = useState(false);
   const [fatal, setFatal] = useState("");
+  const [confirmAction, setConfirmAction] = useState<"logout" | "rotate" | null>(null);
   const dialog = useRef<HTMLElement>(null);
   const flip = useCallback(
     () => setView((v) => (v === "overhead" ? "first" : "overhead")),
@@ -109,12 +114,29 @@ export default function App() {
   );
   useEffect(
     () => () => {
+      generation.current++;
+      opening.current?.abort();
       void connection.current?.close();
     },
     [],
   );
   useEffect(() => {
-    if (!modal) return;
+    const forget = (event: StorageEvent) => {
+      if (event.key !== "roomie-auth" && event.key !== null) return;
+      if (event.newValue !== null) return;
+      void leave();
+      setInput("");
+      setBusy(false);
+      setConfirmAction(null);
+    };
+    window.addEventListener("storage", forget);
+    return () => window.removeEventListener("storage", forget);
+  }, []);
+  useEffect(() => {
+    if (!modal) {
+      setConfirmAction(null);
+      return;
+    }
     const previous = document.activeElement as HTMLElement | null;
     const focusable = () =>
       Array.from(
@@ -146,16 +168,30 @@ export default function App() {
       window.removeEventListener("keydown", handle);
       previous?.focus();
     };
-  }, [modal, busy, code]);
+  }, [modal, busy, code, confirmAction]);
   async function enter(join: boolean) {
+    if (busy || connection.current) return;
+    const attempt = ++generation.current;
+    const controller = new AbortController();
+    opening.current = controller;
     setBusy(true);
     setError("");
     try {
+      const parsed = join ? inviteCode(input) : undefined;
+      if (join && !parsed) throw new Error("招待リンクを確認してください。");
       const next = await connectRoom(
-        join ? inviteCode(input) : undefined,
+        parsed,
         player.current.id,
-        { peers: setPeers, status: setStatus },
+        {
+          peers: (players) => { if (attempt === generation.current) setPeers(players); },
+          status: (value) => { if (attempt === generation.current) setStatus(value); },
+        },
+        controller.signal,
       );
+      if (attempt !== generation.current) {
+        await next.close();
+        return;
+      }
       connection.current = next;
       player.current.slot = next.slot;
       if (
@@ -173,19 +209,55 @@ export default function App() {
         `${location.pathname}${location.search}#invite=${next.code}`,
       );
     } catch (e) {
+      if (attempt !== generation.current) return;
       setError(e instanceof Error ? e.message : "接続できませんでした。");
       setStatus("未接続");
     } finally {
-      setBusy(false);
+      if (attempt === generation.current) setBusy(false);
     }
   }
   async function leave() {
-    await connection.current?.close();
+    generation.current++;
+    opening.current?.abort();
+    const current = connection.current;
     connection.current = null;
     setCode("");
     setPeers([]);
     setStatus("ひとりで探索中");
     history.replaceState(null, "", location.pathname + location.search);
+    try {
+      await current?.close();
+    } catch {
+      setError("接続の終了を確認できませんでした。ページを閉じてください。");
+    }
+  }
+  async function confirm() {
+    if (busy) return;
+    let attempt = generation.current;
+    setBusy(true);
+    setError("");
+    try {
+      if (confirmAction === "logout") {
+        await leave();
+        attempt = generation.current;
+        await logoutDevice();
+        if (attempt !== generation.current) return;
+        setInput("");
+      } else if (confirmAction === "rotate" && connection.current?.rotateInvite) {
+        const next = await connection.current.rotateInvite();
+        if (attempt !== generation.current) return;
+        setCode(next);
+        setInput(next);
+        setCopied(false);
+        history.replaceState(null, "", `${location.pathname}${location.search}#invite=${next}`);
+      }
+      setConfirmAction(null);
+    } catch (e) {
+      if (attempt !== generation.current) return;
+      setError(e instanceof Error ? e.message : "操作を完了できませんでした。");
+    } finally {
+      if (attempt === generation.current) setBusy(false);
+    }
   }
   const invite = code
     ? `${location.origin}${location.pathname}#invite=${code}`
@@ -427,7 +499,11 @@ export default function App() {
             <div className="eyebrow">A PLACE FOR THE TWO OF YOU</div>
             <h2 id="modal-title">
               {modal === "room"
-                ? "いつもの場所に、招待しよう。"
+                ? confirmAction === "logout"
+                  ? "この端末からログアウトしますか？"
+                  : confirmAction === "rotate"
+                    ? "招待リンクを再発行しますか？"
+                    : "いつもの場所に、招待しよう。"
                 : "ふたりの世界の歩き方。"}
             </h2>
             {modal === "help" ? (
@@ -464,11 +540,11 @@ export default function App() {
               </>
             ) : (
               <>
-                <p>
+                {!confirmAction && <p>
                   {code
                     ? "この招待リンクを、もうひとりに。"
                     : "ふたりだけのルームを作るか、届いた招待で参加できます。"}
-                </p>
+                </p>}
                 <div className="mode-note">
                   <span className="mode-badge">
                     {local || !onlineConfigured
@@ -481,7 +557,21 @@ export default function App() {
                       : "Supabaseで接続します。招待リンクはパートナーだけに共有してください。"}
                   </span>
                 </div>
-                {code ? (
+                {confirmAction ? (
+                  <>
+                    <p>
+                      {confirmAction === "logout"
+                        ? "この端末の認証と記憶した招待を消します。匿名ユーザーは復元できず、同じルームの本人の席にも戻れなくなります。同じブラウザの他のタブにも影響します。"
+                        : "古い招待リンクを無効にして、新しいリンクを作ります。参加済みの相手の席は残りますが、次の再入室には新しいリンクが必要です。"}
+                    </p>
+                    <button className="primary-button" disabled={busy} onClick={() => void confirm()}>
+                      {busy ? "処理しています…" : confirmAction === "logout" ? "ログアウトする（復元できません）" : "新しい招待リンクを発行する"}
+                    </button>
+                    <button className="secondary-button" disabled={busy} onClick={() => setConfirmAction(null)}>
+                      キャンセル
+                    </button>
+                  </>
+                ) : code ? (
                   <>
                     <label className="field-label" htmlFor="invite-out">
                       招待リンク
@@ -493,7 +583,7 @@ export default function App() {
                         readOnly
                         onFocus={(e) => e.target.select()}
                       />
-                      <button aria-label="招待リンクをコピー" onClick={copy}>
+                      <button aria-label="招待リンクをコピー" disabled={busy} onClick={copy}>
                         <Icon name="copy" size={18} />
                       </button>
                     </div>
@@ -506,12 +596,19 @@ export default function App() {
                     </div>
                     <button
                       className="primary-button"
+                      disabled={busy}
                       onClick={() => setModal(null)}
                     >
                       世界にもどる <Icon name="arrow" size={17} />
                     </button>
+                    {connection.current?.rotateInvite && (
+                      <button className="secondary-button" disabled={busy} onClick={() => { setError(""); setConfirmAction("rotate"); }}>
+                        招待リンクを再発行する
+                      </button>
+                    )}
                     <button
                       className="leave-button"
+                      disabled={busy}
                       onClick={() => void leave()}
                     >
                       ルームから退出する
@@ -548,6 +645,7 @@ export default function App() {
                         placeholder="ここに招待リンクを貼り付け"
                         autoComplete="off"
                         required
+                        maxLength={MAX_INVITE_INPUT}
                       />
                       <button
                         className="secondary-button"
@@ -558,6 +656,11 @@ export default function App() {
                       </button>
                     </form>
                   </>
+                )}
+                {onlineConfigured && !local && !confirmAction && (
+                  <button className="leave-button" disabled={busy} onClick={() => { setError(""); setConfirmAction("logout"); }}>
+                    この端末からログアウト
+                  </button>
                 )}
                 {error && (
                   <p className="error" role="alert">
