@@ -33,8 +33,12 @@ async function until(check, message) {
 }
 function watch(c, room, id) {
   const updates = [];
+  let postgresReady = false;
   const channel = c.channel(`room:${room}`, { config: { private: true, presence: { key: id } } })
     .on("postgres_changes", { event: "UPDATE", schema: "public", table: "room_members", filter: `room_id=eq.${room}` }, ({ new: row }) => updates.push(row))
+    .on("system", {}, (payload) => {
+      if (payload.extension === "postgres_changes") postgresReady = payload.status === "ok";
+    })
     .on("presence", { event: "sync" }, () => {});
   const ready = new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("Realtime接続タイムアウト")), 15000);
@@ -54,7 +58,7 @@ function watch(c, room, id) {
       }
     });
   });
-  return { channel, updates, ready };
+  return { channel, updates, ready: ready.then(() => until(() => postgresReady, "Postgres変更配信の準備が完了しない")) };
 }
 async function denyPresence(c, room, id) {
   const channel = c.channel(`room:${room}`, { config: { private: true, presence: { key: id } } });

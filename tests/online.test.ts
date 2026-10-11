@@ -9,9 +9,14 @@ const roomId = "11111111-1111-1111-1111-111111111111";
 const code = `${roomId}.${"a".repeat(48)}`;
 const peer = { user_id: "peer", ...spawn("peer", 1) };
 
-function server() {
+function server(automaticDatabaseReady = true) {
   let subscribed: (status: string) => Promise<void>;
   const handlers = new Map<string, (payload?: any) => void>();
+  const status = async (s: string) => {
+    await subscribed(s);
+    if (s === "SUBSCRIBED" && automaticDatabaseReady)
+      handlers.get("system")?.({ extension: "postgres_changes", status: "ok" });
+  };
   const write = vi.fn().mockResolvedValue({ error: null });
   const rows = vi.fn().mockResolvedValue({ data: [peer], error: null });
   const update = {
@@ -25,7 +30,7 @@ function server() {
     }),
     subscribe: vi.fn((callback) => {
       subscribed = callback;
-      queueMicrotask(() => void callback("SUBSCRIBED"));
+      queueMicrotask(() => void status("SUBSCRIBED"));
       return channel;
     }),
     track: vi.fn().mockResolvedValue("ok"),
@@ -45,7 +50,7 @@ function server() {
     from: vi.fn(() => ({ select: () => ({ eq: rows }), update: () => update })),
   };
   createClient.mockReturnValue(client);
-  return { client, channel, handlers, rows, write, status: (s: string) => subscribed(s) };
+  return { client, channel, handlers, rows, write, status };
 }
 
 beforeEach(() => {
@@ -68,6 +73,29 @@ async function connect() {
 }
 
 describe("online connection", () => {
+  it("waits for database replication readiness before marking the room online", async () => {
+    const s = server(false);
+    const { opening, events } = await connect();
+    await vi.waitFor(() => expect(s.channel.track).toHaveBeenCalled());
+    s.handlers.get("system")!({ extension: "system", status: "ok" });
+    expect(events.status).not.toHaveBeenCalledWith("オンライン");
+    s.handlers.get("system")!({ extension: "postgres_changes", status: "ok" });
+    const connection = await opening;
+    expect(events.status).toHaveBeenLastCalledWith("オンライン");
+    await connection.close();
+  });
+
+  it("cleans up when database replication cannot start", async () => {
+    const s = server(false);
+    const { opening } = await connect();
+    const rejected = expect(opening).rejects.toThrow("位置配信");
+    await vi.waitFor(() => expect(s.channel.track).toHaveBeenCalled());
+    s.handlers.get("system")!({ extension: "postgres_changes", status: "error" });
+    await rejected;
+    expect(s.client.removeAllChannels).toHaveBeenCalledOnce();
+    expect(localStorage.setItem).not.toHaveBeenCalled();
+  });
+
   it("keeps the browser identity and remembers the room only after connecting", async () => {
     const s = server();
     const { opening } = await connect();

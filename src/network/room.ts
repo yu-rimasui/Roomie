@@ -212,6 +212,8 @@ async function onlineRoom(
     const id = session.user.id;
     await client.realtime.setAuth(session.access_token);
     let connected = false,
+      presenceReady = false,
+      postgresReady = false,
       subscription = 0,
       active = new Set<string>(),
       roster: Player[] = [];
@@ -264,10 +266,30 @@ async function onlineRoom(
         () => reject(new Error("接続がタイムアウトしました。")),
         12000,
       );
-      channel.subscribe(async (status) => {
+      const ready = () => {
+        if (closed || !presenceReady || !postgresReady) return;
+        connected = true;
+        events.status("オンライン");
+        void refresh();
+        clearTimeout(timeout);
+        resolve();
+      };
+      channel.on("system", {}, (payload) => {
+        if (closed || payload.extension !== "postgres_changes") return;
+        postgresReady = payload.status === "ok";
+        if (postgresReady) ready();
+        else {
+          connected = false;
+          events.peers([]);
+          events.status("位置配信エラー・再入室してください");
+          clearTimeout(timeout);
+          reject(new Error("位置配信の準備ができませんでした。再入室してください。"));
+        }
+      }).subscribe(async (status) => {
         if (closed) return;
         const attempt = ++subscription;
         if (status === "SUBSCRIBED") {
+          presenceReady = false;
           const result = await channel.track({ online: true }).catch(() => "error");
           if (closed || attempt !== subscription) return;
           if (result !== "ok") {
@@ -278,13 +300,12 @@ async function onlineRoom(
             reject(new Error("在室情報を送信できません。"));
             return;
           }
-          connected = true;
-          events.status("オンライン");
-          void refresh();
-          clearTimeout(timeout);
-          resolve();
+          presenceReady = true;
+          ready();
         } else if (["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(status)) {
           connected = false;
+          presenceReady = false;
+          postgresReady = false;
           active.clear();
           events.status("切断・再接続中");
           events.peers([]);
@@ -313,6 +334,7 @@ async function onlineRoom(
           pending ||
           signature === lastSent ||
           performance.now() - last < 100 ||
+          !connected ||
           closed
         )
           return;
