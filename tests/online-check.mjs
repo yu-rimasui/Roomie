@@ -93,8 +93,17 @@ try {
     people.push({ c, id: auth.user.id, storage });
   }
   const [host, a, b] = people;
-  const room = checked(await host.c.rpc("create_room"), "ルーム作成失敗");
+  const creation = await Promise.all([host.c.rpc("create_room"), host.c.rpc("create_room")]);
+  assert.equal(creation.filter((r) => !r.error).length, 1, "同時作成の成功は1件だけ");
+  assert.equal(creation.filter((r) => r.error?.code === "PT429").length, 1, "同時作成の残りは頻度制限で拒否");
+  const room = checked(creation.find((r) => !r.error), "ルーム作成失敗");
   const join = (p, token = room.invite_token, rid = room.room_id) => p.c.rpc("join_room", { target_room: rid, invite_token: token });
+  assert((await a.c.rpc("rotate_invite", { target_room: room.room_id })).error, "非作成者の招待再発行拒否");
+  const originalToken = room.invite_token;
+  room.invite_token = checked(await host.c.rpc("rotate_invite", { target_room: room.room_id }), "招待再発行失敗");
+  assert.notEqual(room.invite_token, originalToken, "再発行でトークンが変わること");
+  assert.equal((await join(a, originalToken)).error?.message, "Invalid invite", "旧招待リンク拒否");
+  assert.equal((await host.c.rpc("rotate_invite", { target_room: room.room_id })).error?.code, "PT429", "再発行頻度制限");
   for (const token of [null, "", "x", "0".repeat(48)]) {
     assert.equal((await join(a, token)).error?.message, "Invalid invite", "不正招待が拒否されること");
   }
@@ -115,6 +124,10 @@ try {
     assert.deepEqual(checked(result, "他人の更新リクエスト失敗"), [], "他人の座標を更新できないこと");
   }
   assert((await host.c.from("room_members").update({ slot: 1 }).eq("room_id", room.room_id)).error, "席の書き換え拒否");
+  assert((await host.c.from("room_members").update({ moved_at: new Date().toISOString() }).eq("room_id", room.room_id)).error, "移動制限時刻の書き換え拒否");
+  for (const field of ["area", "x", "z", "yaw"]) {
+    assert.equal((await host.c.from("room_members").update({ [field]: null }).eq("room_id", room.room_id).eq("user_id", host.id)).error?.code, "23502", "NULL座標とエリアの拒否");
+  }
   await denyPresence(outsider.c, room.room_id, outsider.id);
   const h = watch(host.c, room.room_id, host.id);
   const g = watch(guest.c, room.room_id, guest.id);
@@ -143,7 +156,10 @@ try {
   await until(() => Boolean(h.channel.presenceState()[guest.id]), "再接続Presence同期失敗");
   await move(guest, "home", 2);
   await until(() => h.updates.some((p) => p.user_id === guest.id && p.area === "home" && p.x === 2), "再接続後の座標配信失敗");
-  console.log("PASS: 招待・同時参加上限・RLS・非公開Presence・双方向座標配信・保存済み認証からの再入室");
+  checked(await host.c.auth.signOut({ scope: "local" }), "端末ログアウト失敗");
+  assert.equal(checked(await host.c.auth.getSession(), "ログアウト確認失敗").session, null, "ログアウトでセッションが消えること");
+  assert.equal(host.storage.getItem("roomie-auth"), null, "SDKが端末の認証保存を消すこと");
+  console.log("PASS: 同時作成制限・招待再発行・NULL拒否・同時参加上限・RLS・非公開Presence・双方向座標配信・再入室・端末ログアウト");
 } catch (error) {
   // SDK errors may contain request details; report only our fixed check messages.
   console.error(error instanceof assert.AssertionError ? `FAIL: ${error.message.split("\n")[0]}` : "FAIL: 接続検証が完了しませんでした。Supabase設定と接続を確認してください。");
